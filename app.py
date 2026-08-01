@@ -1,8 +1,8 @@
 """UServe Contractor Service Review Console — Streamlit edition.
 
-For production, set DATABASE_URL to a managed Postgres database and replace the
-SQLite connection function below with the provider's SQLAlchemy connection.
-SQLite is appropriate for a single-user or test deployment only.
+Uses a hosted Postgres database (e.g. Supabase, Neon). The connection string is
+read from the DATABASE_URL Streamlit secret — never hardcoded and never committed
+to the repository. See README.md for setup instructions.
 """
 from __future__ import annotations
 
@@ -11,11 +11,12 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import streamlit as st
 
 try:
@@ -24,7 +25,6 @@ except ImportError:
     st_autorefresh = None
 
 APP_DIR = Path(__file__).parent
-DB_PATH = APP_DIR / "userve_audits.db"
 LOGO_PATH = APP_DIR / "assets" / "logo.png"
 WINDOWS = {"Morning (7–9 AM)": (7, 9), "Daytime (9 AM–5:30 PM)": (9, 17.5), "Evening (5:30–9 PM)": (17.5, 21)}
 WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -39,49 +39,80 @@ TIER_COLORS = {
 }
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_database_url() -> str:
+    """Read the Postgres connection string from Streamlit secrets or the environment.
+
+    Never hardcode this value and never commit it to the repository. Locally, put
+    it in .streamlit/secrets.toml (already gitignored). On Streamlit Community
+    Cloud, set it in the app's Settings -> Secrets panel.
+    """
+    if "DATABASE_URL" in st.secrets:
+        return st.secrets["DATABASE_URL"]
+    env_value = os.environ.get("DATABASE_URL")
+    if env_value:
+        return env_value
+    st.error(
+        "No DATABASE_URL is configured. Add one to .streamlit/secrets.toml locally, "
+        "or to this app's Secrets in Streamlit Community Cloud. See README.md."
+    )
+    st.stop()
+
+
+def db() -> psycopg2.extensions.connection:
+    return psycopg2.connect(get_database_url(), cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def setup() -> None:
-    with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS servers (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL,
-          company TEXT, territory TEXT,
-          audit_day INTEGER DEFAULT 0, audit_time TEXT DEFAULT '09:00', active INTEGER DEFAULT 1
-        );
-        CREATE TABLE IF NOT EXISTS server_tokens (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, token TEXT UNIQUE NOT NULL,
-          created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS live_audits (
-          server_id INTEGER PRIMARY KEY, snapshot TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS reviews (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, review_date TEXT NOT NULL,
-          completion_rate REAL, score REAL, tier TEXT, first_attempt_rate REAL,
-          average_days_to_service REAL, attempt_quality REAL, report_notes TEXT,
-          created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE TABLE IF NOT EXISTS audit_completions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, week_start TEXT NOT NULL,
-          completed_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(server_id, week_start)
-        );
-        """)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS servers (
+              id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL,
+              company TEXT, territory TEXT,
+              audit_day INTEGER DEFAULT 0, audit_time TEXT DEFAULT '09:00', active BOOLEAN DEFAULT TRUE
+            );
+            CREATE TABLE IF NOT EXISTS server_tokens (
+              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), token TEXT UNIQUE NOT NULL,
+              created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS live_audits (
+              server_id INTEGER PRIMARY KEY REFERENCES servers(id), snapshot TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reviews (
+              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), review_date TEXT NOT NULL,
+              completion_rate REAL, score REAL, tier TEXT, first_attempt_rate REAL,
+              average_days_to_service REAL, attempt_quality REAL, report_notes TEXT,
+              created_at TIMESTAMP DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS audit_completions (
+              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), week_start TEXT NOT NULL,
+              completed_at TIMESTAMP DEFAULT now(), UNIQUE(server_id, week_start)
+            );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def rows(query: str, params: tuple = ()) -> list[dict]:
-    with db() as conn:
-        return [dict(row) for row in conn.execute(query, params).fetchall()]
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
 
 
 def execute(query: str, params: tuple = ()) -> None:
-    with db() as conn:
-        conn.execute(query, params)
+    conn = db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
         conn.commit()
+    finally:
+        conn.close()
 
 
 def current_week() -> date:
@@ -91,12 +122,12 @@ def current_week() -> date:
 
 def generate_server_token(server_id: int) -> tuple[str, datetime]:
     """Create a fresh 15-minute access code for a server, invalidating any unused one."""
-    execute("DELETE FROM server_tokens WHERE server_id = ? AND used_at IS NULL", (server_id,))
+    execute("DELETE FROM server_tokens WHERE server_id = %s AND used_at IS NULL", (server_id,))
     token = secrets.token_hex(4).upper()  # 8-character code, e.g. "A1B2C3D4"
     created = datetime.now()
     expires = created + timedelta(minutes=15)
     execute(
-        "INSERT INTO server_tokens (server_id, token, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO server_tokens (server_id, token, created_at, expires_at) VALUES (%s, %s, %s, %s)",
         (server_id, token, created.isoformat(), expires.isoformat()),
     )
     return token, expires
@@ -105,26 +136,26 @@ def generate_server_token(server_id: int) -> tuple[str, datetime]:
 def consume_server_token(token: str) -> dict | None:
     """Validate an unused, unexpired token and mark it used. Returns the token row, or None."""
     matches = rows(
-        "SELECT * FROM server_tokens WHERE token = ? AND used_at IS NULL AND expires_at > ?",
+        "SELECT * FROM server_tokens WHERE token = %s AND used_at IS NULL AND expires_at > %s",
         (token.strip().upper(), datetime.now().isoformat()),
     )
     if not matches:
         return None
     match = matches[0]
-    execute("UPDATE server_tokens SET used_at = ? WHERE id = ?", (datetime.now().isoformat(), match["id"]))
+    execute("UPDATE server_tokens SET used_at = %s WHERE id = %s", (datetime.now().isoformat(), match["id"]))
     return match
 
 
 def save_live_audit(server_id: int, snapshot: dict) -> None:
     execute(
-        """INSERT INTO live_audits (server_id, snapshot, updated_at) VALUES (?, ?, ?)
-           ON CONFLICT(server_id) DO UPDATE SET snapshot = excluded.snapshot, updated_at = excluded.updated_at""",
+        """INSERT INTO live_audits (server_id, snapshot, updated_at) VALUES (%s, %s, %s)
+           ON CONFLICT (server_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = EXCLUDED.updated_at""",
         (server_id, json.dumps(snapshot), datetime.now().isoformat()),
     )
 
 
 def load_live_audit(server_id: int) -> dict | None:
-    matches = rows("SELECT snapshot, updated_at FROM live_audits WHERE server_id = ?", (server_id,))
+    matches = rows("SELECT snapshot, updated_at FROM live_audits WHERE server_id = %s", (server_id,))
     return json.loads(matches[0]["snapshot"]) if matches else None
 
 
@@ -301,9 +332,9 @@ def add_server_form() -> None:
                 if not name.strip(): st.error("A contractor name is required.")
                 else:
                     try:
-                        execute("INSERT INTO servers (name, company, territory, audit_day, audit_time, active) VALUES (?, ?, ?, ?, ?, 1)", (name.strip(), company_value.strip(), territory_value.strip(), WEEK_DAYS.index(day_value), time_value.strftime("%H:%M")))
+                        execute("INSERT INTO servers (name, company, territory, audit_day, audit_time, active) VALUES (%s, %s, %s, %s, %s, TRUE)", (name.strip(), company_value.strip(), territory_value.strip(), WEEK_DAYS.index(day_value), time_value.strftime("%H:%M")))
                         st.success(f"Added {name.strip()}.")
-                    except sqlite3.IntegrityError: st.error("That contractor is already in the roster.")
+                    except psycopg2.IntegrityError: st.error("That contractor is already in the roster.")
 
 
 def service_audit(servers: list[dict]) -> None:
@@ -383,8 +414,8 @@ def service_audit(servers: list[dict]) -> None:
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
     if st.button("Archive this weekly review", type="primary"):
-        execute("INSERT INTO reviews (server_id, review_date, completion_rate, score, tier, first_attempt_rate, average_days_to_service, attempt_quality, report_notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (selected["id"], date.today().isoformat(), result["completion"], result["score"], tier(result["score"]), result["first_rate"], result["speed"], result["quality"], note))
-        execute("INSERT OR IGNORE INTO audit_completions (server_id, week_start) VALUES (?, ?)", (selected["id"], current_week().isoformat()))
+        execute("INSERT INTO reviews (server_id, review_date, completion_rate, score, tier, first_attempt_rate, average_days_to_service, attempt_quality, report_notes) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", (selected["id"], date.today().isoformat(), result["completion"], result["score"], tier(result["score"]), result["first_rate"], result["speed"], result["quality"], note))
+        execute("INSERT INTO audit_completions (server_id, week_start) VALUES (%s, %s) ON CONFLICT (server_id, week_start) DO NOTHING", (selected["id"], current_week().isoformat()))
         st.success("Weekly review archived. The contractor has been removed from this week's audit queue.")
 
 
@@ -393,7 +424,7 @@ def management() -> None:
     add_server_form()
     servers = rows("SELECT * FROM servers ORDER BY active DESC, audit_day, audit_time, name")
     active = [server for server in servers if server["active"]]
-    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = ?", (current_week().isoformat(),))}
+    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = %s", (current_week().isoformat(),))}
     queue = [server for server in active if server["id"] not in completed_ids]
     a, b, c = st.columns(3)
     a.metric("Active contractors", len(active))
@@ -406,7 +437,7 @@ def management() -> None:
             left.write(f"**{server['name']}**  \n{server['company'] or 'Independent contractor'}")
             middle.write(f"{WEEK_DAYS[server['audit_day']]} · {server['audit_time']}")
             if right.button("Complete", key=f"complete-{server['id']}"):
-                execute("INSERT OR IGNORE INTO audit_completions (server_id, week_start) VALUES (?, ?)", (server["id"], current_week().isoformat()))
+                execute("INSERT INTO audit_completions (server_id, week_start) VALUES (%s, %s) ON CONFLICT (server_id, week_start) DO NOTHING", (server["id"], current_week().isoformat()))
                 st.rerun()
     else: st.success("All active contractors are complete for this week.")
     st.subheader("Contractor roster")
@@ -415,10 +446,10 @@ def management() -> None:
             st.write(f"{server['company'] or 'Independent contractor'}")
             one, two, three = st.columns(3)
             if one.button("Mark inactive" if server['active'] else "Reactivate", key=f"active-{server['id']}"):
-                execute("UPDATE servers SET active = ? WHERE id = ?", (0 if server["active"] else 1, server["id"]))
+                execute("UPDATE servers SET active = %s WHERE id = %s", (not server["active"], server["id"]))
                 st.rerun()
             if server['id'] in completed_ids and two.button("Undo completion", key=f"undo-{server['id']}"):
-                execute("DELETE FROM audit_completions WHERE server_id = ? AND week_start = ?", (server["id"], current_week().isoformat()))
+                execute("DELETE FROM audit_completions WHERE server_id = %s AND week_start = %s", (server["id"], current_week().isoformat()))
                 st.rerun()
     st.subheader("Portfolio performance and saved audit history")
     reviews = rows("SELECT r.*, s.name FROM reviews r JOIN servers s ON s.id = r.server_id ORDER BY r.review_date DESC, r.created_at DESC")
@@ -431,7 +462,7 @@ def management() -> None:
         review_options = {f"{r['review_date']} — {r['name']} — {r['score']:.1f}": r for r in reviews}
         delete_choice = st.selectbox("Saved audit", list(review_options))
         if st.button("Delete selected saved audit", type="secondary"):
-            execute("DELETE FROM reviews WHERE id = ?", (review_options[delete_choice]["id"],))
+            execute("DELETE FROM reviews WHERE id = %s", (review_options[delete_choice]["id"],))
             st.success("Saved audit deleted."); st.rerun()
     else: st.info("No weekly reviews have been archived yet.")
 
@@ -460,7 +491,7 @@ def contractor_session_view(server_session: dict) -> None:
     server_id = server_session["server_id"]
     expires_at = datetime.fromisoformat(server_session["expires_at"])
     remaining = expires_at - datetime.now()
-    server_rows = rows("SELECT * FROM servers WHERE id = ?", (server_id,))
+    server_rows = rows("SELECT * FROM servers WHERE id = %s", (server_id,))
     server = server_rows[0] if server_rows else None
     if not server:
         brand_header("Your Current Weekly Review")
@@ -505,8 +536,8 @@ def contractor_session_view(server_session: dict) -> None:
 
 def dashboard() -> None:
     brand_header("Dashboard", "This week's audit progress and combined urgent jobs across all in-progress reviews.")
-    servers = rows("SELECT * FROM servers WHERE active = 1 ORDER BY name")
-    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = ?", (current_week().isoformat(),))}
+    servers = rows("SELECT * FROM servers WHERE active = TRUE ORDER BY name")
+    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = %s", (current_week().isoformat(),))}
     a, b, c = st.columns(3)
     a.metric("Active contractors", len(servers))
     b.metric("Completed this week", len(completed_ids))
@@ -544,7 +575,7 @@ def main() -> None:
     st.sidebar.divider()
     st.sidebar.caption("90-day review window · 65% completion standard")
     if section == "Dashboard": dashboard()
-    elif section == "Service Audit": service_audit(rows("SELECT * FROM servers WHERE active = 1 ORDER BY name"))
+    elif section == "Service Audit": service_audit(rows("SELECT * FROM servers WHERE active = TRUE ORDER BY name"))
     elif section == "Management": management()
     else: contractor_login()
 
