@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+userve_audits.db
+.streamlit/secrets.toml
