@@ -1,584 +1,546 @@
-"""UServe Contractor Service Review Console — Streamlit edition.
-
-Uses a hosted Postgres database (e.g. Supabase, Neon). The connection string is
-read from the DATABASE_URL Streamlit secret — never hardcoded and never committed
-to the repository. See README.md for setup instructions.
-"""
 from __future__ import annotations
 
-import html
+import hashlib
+import io
 import json
 import os
 import re
 import secrets
+import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-import psycopg2
-import psycopg2.extras
+import plotly.express as px
 import streamlit as st
 
+
+APP_TITLE = "UServe Contractor Service Review"
+BASE = Path(__file__).resolve().parent
 try:
-    from streamlit_autorefresh import st_autorefresh
-except ImportError:
-    st_autorefresh = None
+    DB_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", ""))
+except Exception:
+    DB_URL = os.getenv("DATABASE_URL", "")
+REQUIRED_REPORTS = ["Jobs with attempts", "Jobs with no attempts", "Historical job detail"]
+REPORT_TYPES = REQUIRED_REPORTS + ["Server performance", "Daily activity log"]
 
-APP_DIR = Path(__file__).parent
-LOGO_PATH = APP_DIR / "assets" / "logo.png"
-WINDOWS = {"Morning (7–9 AM)": (7, 9), "Daytime (9 AM–5:30 PM)": (9, 17.5), "Evening (5:30–9 PM)": (17.5, 21)}
-WEEK_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-TIER_COLORS = {
-    "Diamond Elite": "#1F3B25",
-    "Diamond": "#355E3B",
-    "Gold": "#B8860B",
-    "Silver": "#6B7280",
-    "Green": "#5C7A4A",
-    "Blue": "#3B5BA5",
-    "Red": "#B3261E",
-}
-
-
-def get_database_url() -> str:
-    """Read the Postgres connection string from Streamlit secrets or the environment.
-
-    Never hardcode this value and never commit it to the repository. Locally, put
-    it in .streamlit/secrets.toml (already gitignored). On Streamlit Community
-    Cloud, set it in the app's Settings -> Secrets panel.
+st.set_page_config(page_title=APP_TITLE, page_icon="🟢", layout="wide")
+st.markdown(
     """
-    if "DATABASE_URL" in st.secrets:
-        return st.secrets["DATABASE_URL"]
-    env_value = os.environ.get("DATABASE_URL")
-    if env_value:
-        return env_value
-    st.error(
-        "No DATABASE_URL is configured. Add one to .streamlit/secrets.toml locally, "
-        "or to this app's Secrets in Streamlit Community Cloud. See README.md."
-    )
-    st.stop()
+    <style>
+    .stApp{background:#f4f7f5}.block-container{padding-top:1rem;max-width:1500px}
+    [data-testid="stSidebar"]{background:#102b1c}.brand-box{background:#fff;border-radius:14px;padding:12px;margin-bottom:12px}
+    .hero{background:linear-gradient(120deg,#0c4d29,#198846);color:white;border-radius:18px;padding:24px 28px;margin-bottom:16px}
+    .hero h1{margin:0;font-size:2rem}.hero p{margin:.4rem 0 0;color:#dcefe3}
+    .card{background:white;border:1px solid #dfe8e2;border-radius:14px;padding:16px;margin-bottom:12px}
+    .warning-card{background:#fff8e8;border:1px solid #edd39a;border-left:5px solid #bd7b05;border-radius:12px;padding:14px;margin:8px 0}
+    .danger-card{background:#fff0ee;border:1px solid #efc3bd;border-left:5px solid #b9362b;border-radius:12px;padding:14px;margin:8px 0}
+    .good-card{background:#eaf7ef;border:1px solid #b9dfc6;border-left:5px solid #18743a;border-radius:12px;padding:14px;margin:8px 0}
+    .tier{display:inline-block;padding:5px 10px;border-radius:20px;background:#e7f4eb;color:#136633;font-weight:800}
+    div[data-testid="stMetric"]{background:white;border:1px solid #dfe8e2;padding:14px;border-radius:12px}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-def db() -> psycopg2.extensions.connection:
-    return psycopg2.connect(get_database_url(), cursor_factory=psycopg2.extras.RealDictCursor)
+def now_iso() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat()
 
 
-def setup() -> None:
-    conn = db()
+def db_connect():
+    if DB_URL:
+        from sqlalchemy import create_engine
+        return create_engine(DB_URL, pool_pre_ping=True).connect()
+    return sqlite3.connect(BASE / "userve_auditor.db", check_same_thread=False)
+
+
+def execute(sql: str, params: tuple = (), fetch: bool = False):
+    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS servers (
-              id SERIAL PRIMARY KEY, name TEXT UNIQUE NOT NULL,
-              company TEXT, territory TEXT,
-              audit_day INTEGER DEFAULT 0, audit_time TEXT DEFAULT '09:00', active BOOLEAN DEFAULT TRUE
-            );
-            CREATE TABLE IF NOT EXISTS server_tokens (
-              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), token TEXT UNIQUE NOT NULL,
-              created_at TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS live_audits (
-              server_id INTEGER PRIMARY KEY REFERENCES servers(id), snapshot TEXT NOT NULL, updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS reviews (
-              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), review_date TEXT NOT NULL,
-              completion_rate REAL, score REAL, tier TEXT, first_attempt_rate REAL,
-              average_days_to_service REAL, attempt_quality REAL, report_notes TEXT,
-              created_at TIMESTAMP DEFAULT now()
-            );
-            CREATE TABLE IF NOT EXISTS audit_completions (
-              id SERIAL PRIMARY KEY, server_id INTEGER NOT NULL REFERENCES servers(id), week_start TEXT NOT NULL,
-              completed_at TIMESTAMP DEFAULT now(), UNIQUE(server_id, week_start)
-            );
-            """)
+        if DB_URL:
+            from sqlalchemy import text
+            result = conn.execute(text(sql), params if isinstance(params, dict) else {f"p{i}": v for i, v in enumerate(params)})
+            if not fetch:
+                conn.commit()
+            return [dict(row._mapping) for row in result] if fetch else None
+        cur = conn.execute(sql, params)
+        rows = [dict(row) for row in cur.fetchall()] if fetch else None
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def init_db():
+    conn = db_connect()
+    statements = [
+        """CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, company TEXT DEFAULT '', active INTEGER DEFAULT 1, frequency TEXT DEFAULT 'weekly', audit_day TEXT DEFAULT 'Monday', audit_time TEXT DEFAULT '09:00', created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, report_type TEXT NOT NULL, content TEXT NOT NULL, filename TEXT DEFAULT '', imported_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS audits (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, audit_date TEXT NOT NULL, score REAL NOT NULL, tier TEXT NOT NULL, payload TEXT NOT NULL, completed INTEGER DEFAULT 0, created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS server_tokens (token_hash TEXT PRIMARY KEY, audit_id INTEGER NOT NULL, expires_at TEXT NOT NULL, ended INTEGER DEFAULT 0)""",
+    ]
+    try:
+        for statement in statements:
+            if DB_URL:
+                statement = statement.replace("id INTEGER PRIMARY KEY", "id SERIAL PRIMARY KEY")
+                conn.exec_driver_sql(statement)
+            else:
+                conn.execute(statement)
         conn.commit()
     finally:
         conn.close()
 
 
-def rows(query: str, params: tuple = ()) -> list[dict]:
-    conn = db()
+init_db()
+
+
+def read_sql(sql: str, params: tuple = ()) -> pd.DataFrame:
+    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
-            return [dict(row) for row in cur.fetchall()]
+        return pd.read_sql_query(sql, conn, params=params)
     finally:
         conn.close()
 
 
-def execute(query: str, params: tuple = ()) -> None:
-    conn = db()
+def q(sql: str, params: tuple = ()) -> list[dict]:
+    conn = db_connect()
     try:
-        with conn.cursor() as cur:
-            cur.execute(query, params)
+        if DB_URL:
+            from sqlalchemy import text
+            named = {f"p{i}": value for i, value in enumerate(params)}
+            for i in range(len(params)):
+                sql = sql.replace("?", f":p{i}", 1)
+            result = conn.execute(text(sql), named)
+            return [dict(row._mapping) for row in result]
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    finally:
+        conn.close()
+
+
+def run(sql: str, params: tuple = ()):
+    conn = db_connect()
+    try:
+        if DB_URL:
+            from sqlalchemy import text
+            named = {f"p{i}": value for i, value in enumerate(params)}
+            for i in range(len(params)):
+                sql = sql.replace("?", f":p{i}", 1)
+            conn.execute(text(sql), named)
+        else:
+            conn.execute(sql, params)
         conn.commit()
     finally:
         conn.close()
 
 
-def current_week() -> date:
-    today = date.today()
-    return today - timedelta(days=today.weekday())
-
-
-def generate_server_token(server_id: int) -> tuple[str, datetime]:
-    """Create a fresh 15-minute access code for a server, invalidating any unused one."""
-    execute("DELETE FROM server_tokens WHERE server_id = %s AND used_at IS NULL", (server_id,))
-    token = secrets.token_hex(4).upper()  # 8-character code, e.g. "A1B2C3D4"
-    created = datetime.now()
-    expires = created + timedelta(minutes=15)
-    execute(
-        "INSERT INTO server_tokens (server_id, token, created_at, expires_at) VALUES (%s, %s, %s, %s)",
-        (server_id, token, created.isoformat(), expires.isoformat()),
-    )
-    return token, expires
-
-
-def consume_server_token(token: str) -> dict | None:
-    """Validate an unused, unexpired token and mark it used. Returns the token row, or None."""
-    matches = rows(
-        "SELECT * FROM server_tokens WHERE token = %s AND used_at IS NULL AND expires_at > %s",
-        (token.strip().upper(), datetime.now().isoformat()),
-    )
-    if not matches:
-        return None
-    match = matches[0]
-    execute("UPDATE server_tokens SET used_at = %s WHERE id = %s", (datetime.now().isoformat(), match["id"]))
-    return match
-
-
-def save_live_audit(server_id: int, snapshot: dict) -> None:
-    execute(
-        """INSERT INTO live_audits (server_id, snapshot, updated_at) VALUES (%s, %s, %s)
-           ON CONFLICT (server_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, updated_at = EXCLUDED.updated_at""",
-        (server_id, json.dumps(snapshot), datetime.now().isoformat()),
-    )
-
-
-def load_live_audit(server_id: int) -> dict | None:
-    matches = rows("SELECT snapshot, updated_at FROM live_audits WHERE server_id = %s", (server_id,))
-    return json.loads(matches[0]["snapshot"]) if matches else None
-
-
-def normal(value: object) -> str:
+def norm_col(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
-def column(frame: pd.DataFrame, *candidates: str) -> str | None:
-    normalized = {normal(c): c for c in frame.columns}
-    for candidate in candidates:
-        if normal(candidate) in normalized:
-            return normalized[normal(candidate)]
-    for key, original in normalized.items():
-        if any(normal(candidate) in key for candidate in candidates):
-            return original
-    return None
+def norm_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
 
-def parse_date(value: object) -> datetime | None:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+def getv(row: dict, *names: str) -> str:
+    mapping = {norm_col(k): v for k, v in row.items()}
+    for name in names:
+        if norm_col(name) in mapping:
+            return str(mapping[norm_col(name)] or "").strip()
+    return ""
+
+
+def parse_date(value: Any):
+    if value is None or str(value).strip() in ("", "nan", "NaT", "00/00/0000"):
         return None
-    parsed = pd.to_datetime(str(value), errors="coerce")
+    parsed = pd.to_datetime(value, errors="coerce")
     return None if pd.isna(parsed) else parsed.to_pydatetime()
 
 
-def attempts_from_text(value: object) -> list[datetime]:
-    """Parse attempts separated by <br />, line breaks, or normal text."""
-    text = html.unescape(str(value or "")).replace("<br />", "\n").replace("<br/>", "\n").replace("<br>", "\n")
-    found = re.findall(r"\b\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s*[AP]M\b", text, flags=re.I)
-    parsed = [parse_date(item) for item in found]
-    return [item for item in parsed if item]
+ATTEMPT_RE = re.compile(r"^(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})\s*([AP]M)\s*:\s*(.*)$", re.I | re.S)
 
 
-def classify_attempts(events: list[datetime]) -> dict[str, int]:
-    result = {"Morning (7–9 AM)": 0, "Daytime (9 AM–5:30 PM)": 0, "Evening (5:30–9 PM)": 0, "Weekend": 0}
-    for event in events:
-        hour = event.hour + event.minute / 60
-        for label, (start, end) in WINDOWS.items():
-            if start <= hour < end:
-                result[label] += 1
-                break
-        if event.weekday() >= 5:
-            result["Weekend"] += 1
+def parse_attempts(value: Any) -> tuple[list[dict], list[str]]:
+    entries = [part.strip() for part in re.split(r"<br\s*/?>|\r?\n", str(value or ""), flags=re.I) if part.strip()]
+    parsed, invalid = [], []
+    for entry in entries:
+        match = ATTEMPT_RE.match(entry)
+        if not match:
+            invalid.append(entry)
+            continue
+        at = pd.to_datetime(f"{match.group(1)} {match.group(2)} {match.group(3)}", errors="coerce")
+        if pd.isna(at):
+            invalid.append(entry)
+            continue
+        minute = at.hour * 60 + at.minute
+        window = "AM 7–9" if 420 <= minute < 540 else "Daytime 9–5:30" if 540 <= minute < 1050 else "Evening 5:30–9" if 1050 <= minute <= 1260 else "Other"
+        parsed.append({"at": at.to_pydatetime(), "note": match.group(4).strip(), "window": window, "weekend": at.dayofweek == 5})
+    return parsed, invalid
+
+
+def dataframe_from_text(text: str) -> pd.DataFrame:
+    text = text.strip()
+    if not text:
+        return pd.DataFrame()
+    if text.startswith("["):
+        return pd.DataFrame(json.loads(text))
+    for separator in ("\t", ","):
+        try:
+            frame = pd.read_csv(io.StringIO(text), sep=separator, dtype=str, keep_default_na=False, engine="python")
+            if len(frame.columns) > 1:
+                if norm_col(frame.columns[0]) in ("", "unnamed: 0"):
+                    frame = frame.iloc[:, 1:]
+                return frame
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def detect_report(text: str, filename: str = "") -> str:
+    low = text[:10000].lower()
+    if "performance report results" in low or ("% served" in low and "assigned->serve" in low):
+        return "Server performance"
+    if "jobid:" in low and "status:" in low and "dt:" in low:
+        return "Daily activity log"
+    frame = dataframe_from_text(text)
+    columns = {norm_col(column) for column in frame.columns}
+    if "attempts" in columns and ("date served" in columns or "job status" in columns):
+        return "Historical job detail"
+    if any("total attempts" in column for column in columns):
+        return "Jobs with attempts"
+    if any("days from filing" in column for column in columns) or "first attempt: days prior to date received (attempts)" in columns:
+        return "Jobs with no attempts"
+    return "Historical job detail" if filename.lower().endswith((".csv", ".xlsx")) and "attempt" in low else "Needs mapping"
+
+
+def file_to_text(uploaded) -> str:
+    raw = uploaded.getvalue()
+    if uploaded.name.lower().endswith((".xlsx", ".xls")):
+        frame = pd.read_excel(io.BytesIO(raw), dtype=str).fillna("")
+        return frame.to_csv(index=False)
+    return raw.decode("utf-8-sig", errors="replace")
+
+
+def current_reports(server_id: int) -> dict[str, dict]:
+    rows = q("SELECT * FROM reports WHERE server_id=? ORDER BY id DESC", (server_id,))
+    result = {}
+    for row in rows:
+        result.setdefault(row["report_type"], row)
     return result
 
 
+def historical_jobs(text: str) -> list[dict]:
+    frame = dataframe_from_text(text)
+    jobs = []
+    for _, series in frame.iterrows():
+        row = series.to_dict()
+        job_id = getv(row, "Job Id", "Job ID")
+        if not job_id.isdigit():
+            continue
+        attempts, invalid = parse_attempts(getv(row, "Attempts"))
+        served = parse_date(getv(row, "Date Served"))
+        served_time = getv(row, "Time Served")
+        outcome_at = None
+        if served:
+            outcome_at = served
+            if served_time:
+                combined = pd.to_datetime(f"{served.date()} {served_time}", errors="coerce")
+                if not pd.isna(combined):
+                    outcome_at = combined.to_pydatetime()
+        address = " ".join(filter(None, [getv(row, "Servee Address", "Address"), getv(row, "Servee Apt", "Apt"), getv(row, "Servee City"), getv(row, "Servee State"), getv(row, "Servee Zip")]))
+        jobs.append({
+            "id": job_id, "name": getv(row, "Servee Name", "Defendant"), "status": getv(row, "Job Status").lower(),
+            "lawfirm": getv(row, "Lawfirm File No", "Law Firm File No"), "client_id": getv(row, "Client ID", "3rd Party Ref"),
+            "document": getv(row, "Document"), "address": address, "attempts": attempts, "invalid": invalid,
+            "raw_attempt_count": len([x for x in re.split(r"<br\s*/?>|\r?\n", getv(row, "Attempts"), flags=re.I) if x.strip()]),
+            "date_given": parse_date(getv(row, "Date Given to Server")), "server_received": parse_date(getv(row, "Job Recieved By Server", "Job Received By Server")),
+            "court": parse_date(getv(row, "Court Date")), "date_served": served, "outcome_at": outcome_at,
+            "service_code": norm_key(getv(row, "Service Code", "NON-Serve Code")).upper(), "manner": getv(row, "Manner"),
+        })
+    return jobs
+
+
+def inventory_rows(text: str, attempted: bool) -> list[dict]:
+    frame = dataframe_from_text(text)
+    rows = []
+    for _, series in frame.iterrows():
+        row = series.to_dict()
+        job_id = getv(row, "Job Id", "Job ID")
+        if not re.fullmatch(r"\d{5,}", job_id):
+            continue
+        days = getv(row, "Days from File/ Assign/Receive", "Days from Filing/ Assign/Receive", "days from Received")
+        total = getv(row, "Total Attempts")
+        rows.append({"id": job_id, "name": getv(row, "Servee Name"), "days": float(days or 0), "total": int(float(total or 0)) if attempted else 0, "court": parse_date(getv(row, "Court Date", "Court Date-Time")), "assigned": parse_date(getv(row, "Date Given to Server", "Date Assigned/ Received", "Assigned date"))})
+    return rows
+
+
+def duplicate_timestamp_issues(jobs: list[dict]) -> list[dict]:
+    events = []
+    for job in jobs:
+        events += [{"job": job, "at": event["at"], "type": "Attempt", "note": event["note"]} for event in job["attempts"]]
+        if job["status"] == "completed" and job["outcome_at"]:
+            events.append({"job": job, "at": job["outcome_at"], "type": "Served", "note": job["manner"]})
+    groups = {}
+    for event in events:
+        groups.setdefault(event["at"], []).append(event)
+    issues = []
+    for at, group in groups.items():
+        for event in group:
+            job = event["job"]
+            matches = []
+            for other in group:
+                other_job = other["job"]
+                if other_job["id"] == job["id"]:
+                    continue
+                same_file = bool(norm_key(job["lawfirm"])) and norm_key(job["lawfirm"]) == norm_key(other_job["lawfirm"])
+                same_person_address = bool(norm_key(job["name"]) and norm_key(job["address"])) and norm_key(job["name"]) == norm_key(other_job["name"]) and norm_key(job["address"]) == norm_key(other_job["address"])
+                if not same_file and not same_person_address:
+                    matches.append(other)
+            if matches:
+                issues.append({"job_id": job["id"], "servee": job["name"], "issue": "Identical timestamp appears on a different matter/address", "found": f"{at:%m/%d/%Y %I:%M %p} · {event['type']}", "matches": "; ".join(f"#{item['job']['id']} {item['job']['name']}" for item in matches)})
+    return issues
+
+
+def reconcile(attempted: list[dict], unattempted: list[dict], jobs: list[dict]) -> list[dict]:
+    by_id = {job["id"]: job for job in jobs}
+    issues = []
+    for row in attempted:
+        job = by_id.get(row["id"])
+        if not job:
+            issues.append({"job_id": row["id"], "servee": row["name"], "issue": "Job missing from historical detail", "expected": f"{row['total']} attempts", "found": "No matching Job ID"})
+        elif job["invalid"]:
+            issues.append({"job_id": row["id"], "servee": row["name"], "issue": "Attempt entry cannot be parsed", "expected": "Readable dated attempts", "found": f"{len(job['invalid'])} unreadable entries"})
+        elif row["total"] != job["raw_attempt_count"]:
+            issues.append({"job_id": row["id"], "servee": row["name"], "issue": "Attempt totals do not match", "expected": f"{row['total']} in open-jobs report", "found": f"{job['raw_attempt_count']} in historical detail"})
+    for row in unattempted:
+        job = by_id.get(row["id"])
+        if job and job["raw_attempt_count"]:
+            issues.append({"job_id": row["id"], "servee": row["name"], "issue": "Listed as no attempts but attempt history exists", "expected": "0 attempts", "found": f"{job['raw_attempt_count']} dated attempts"})
+    return issues
+
+
 def tier(score: float) -> str:
-    if score >= 75: return "Diamond Elite"
-    if score >= 70: return "Diamond"
-    if score >= 65: return "Gold"
-    if score >= 60: return "Silver"
-    if score >= 51: return "Green"
-    if score >= 26: return "Blue"
-    return "Red"
+    if score <= 25: return "Red"
+    if score <= 50: return "Blue"
+    if score < 60: return "Green"
+    if score < 65: return "Silver"
+    if score <= 70: return "Gold"
+    if score <= 75: return "Diamond"
+    return "Diamond Elite"
 
 
-def tier_badge_html(score: float) -> str:
-    label = tier(score)
-    color = TIER_COLORS.get(label, "#355E3B")
-    return (
-        f'<span style="background:{color};color:#fff;padding:3px 12px;border-radius:999px;'
-        f'font-size:0.8rem;font-weight:600;letter-spacing:.02em;">{label}</span>'
-    )
+def build_review(reports: dict[str, dict]) -> dict:
+    attempted = inventory_rows(reports["Jobs with attempts"]["content"], True)
+    unattempted = inventory_rows(reports["Jobs with no attempts"]["content"], False)
+    jobs = historical_jobs(reports["Historical job detail"]["content"])
+    today = datetime.now()
+    closed = [job for job in jobs if job["status"] in ("completed", "returned") and job["date_served"] and 0 <= (today - job["date_served"]).days <= 90]
+    served = [job for job in closed if job["status"] == "completed"]
+    completion = 100 * len(served) / len(closed) if closed else 0
+    ownership_delays = []
+    for job in jobs:
+        owned = job["server_received"] or job["date_given"]
+        if owned and job["attempts"] and job["attempts"][0]["at"] >= owned:
+            ownership_delays.append((job["attempts"][0]["at"] - owned).days)
+    first_rate = 100 * sum(delay <= 3 for delay in ownership_delays) / len(ownership_delays) if ownership_delays else 0
+    attempts = [event for job in jobs for event in job["attempts"]]
+    off_hours = 100 * sum(event["weekend"] or event["window"] in ("AM 7–9", "Evening 5:30–9") for event in attempts) / len(attempts) if attempts else 0
+    detailed = 100 * sum(len(event["note"]) >= 25 for event in attempts) / len(attempts) if attempts else 0
+    aged_no_attempt = [row for row in unattempted if row["days"] > 2]
+    inventory_rate = 100 * (len(attempted) + len(unattempted) - len(aged_no_attempt)) / max(1, len(attempted) + len(unattempted))
+    service_days = []
+    for job in served:
+        owned = job["server_received"] or job["date_given"]
+        if owned and job["date_served"] and job["date_served"] >= owned:
+            service_days.append((job["date_served"] - owned).days)
+    speed_avg = sum(service_days) / len(service_days) if service_days else None
+    court_risks = []
+    for row in attempted + unattempted:
+        days_to_court = (row["court"] - today).days if row["court"] else None
+        days_since_assign = (today - row["assigned"]).days if row["assigned"] else None
+        if (days_to_court is not None and days_to_court < 10) or row["days"] > 7 or (row["total"] == 0 and row["days"] > 2):
+            court_risks.append({**row, "days_to_court": days_to_court, "days_since_assigned": days_since_assign, "reason": "Court date under 10 days" if days_to_court is not None and days_to_court < 10 else "No attempt is overdue" if row["total"] == 0 else "Activity is stale"})
+    scores = {
+        "Service effectiveness": min(25, completion / 65 * 25),
+        "First-attempt speed": min(15, first_rate / 100 * 15) if ownership_delays else None,
+        "Attempt quality": min(20, ((off_hours + detailed) / 2) / 100 * 20) if attempts else None,
+        "Inventory control": min(15, inventory_rate / 100 * 15),
+        "Speed to service": 10 if speed_avg is not None and speed_avg <= 7 else 7 if speed_avg is not None and speed_avg <= 14 else 3 if speed_avg is not None else None,
+        "Court-date protection": max(0, 10 - min(10, len([job for job in court_risks if job["days_to_court"] is not None]))),
+        "Reporting & documentation": min(5, detailed / 100 * 5) if attempts else None,
+    }
+    measured = sum(value is not None for value in scores.values())
+    score = round(sum(value or 0 for value in scores.values()) * 7 / measured, 1) if measured else 0
+    reconciliation = reconcile(attempted, unattempted, jobs)
+    duplicate_issues = duplicate_timestamp_issues(jobs)
+    activity = []
+    for job in jobs:
+        for event in job["attempts"]:
+            if event["at"] >= today - timedelta(days=7): activity.append({"Date": event["at"].date(), "Window": "Saturday" if event["weekend"] else event["window"], "Events": 1})
+    recommendations = []
+    if completion < 65: recommendations.append("Review non-serve reasons and address quality; completion is below the 65% standard.")
+    if first_rate < 85 and ownership_delays: recommendations.append("Improve first-attempt compliance within three business days of accepted assignments.")
+    if off_hours < 35 and attempts: recommendations.append("Increase morning, evening, and Saturday coverage while retaining control over routes and timing.")
+    if aged_no_attempt: recommendations.append(f"Resolve {len(aged_no_attempt)} accepted assignment(s) with no attempt after two days.")
+    return {"score": score, "tier": tier(score), "completion": completion, "first_rate": first_rate, "off_hours": off_hours, "inventory_rate": inventory_rate, "speed_avg": speed_avg, "scores": scores, "reconciliation": reconciliation, "duplicate_issues": duplicate_issues, "urgent": court_risks, "activity": activity, "recommendations": recommendations, "jobs": len(jobs), "closed": len(closed), "attempts": len(attempts)}
 
 
-def inject_theme() -> None:
-    st.markdown(
-        """
-        <style>
-        [data-testid="stMetric"] {
-            background: #FFFFFF;
-            border: 1px solid #D8E3D6;
-            border-radius: 10px;
-            padding: 14px 16px 10px 16px;
-        }
-        [data-testid="stMetricLabel"] { color: #355E3B; font-weight: 600; }
-        section[data-testid="stSidebar"] { background: #1F3B25; }
-        section[data-testid="stSidebar"] * { color: #F2F5F0 !important; }
-        div.stButton > button, div[data-testid="stFormSubmitButton"] > button {
-            background: #355E3B; color: #fff; border: 1px solid #355E3B; border-radius: 6px;
-        }
-        div.stButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
-            background: #274430; border-color: #274430; color: #fff;
-        }
-        [data-testid="stExpander"] { border: 1px solid #D8E3D6; border-radius: 8px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+def logo():
+    path = BASE / "userve-logo.png"
+    if path.exists(): st.image(str(path), use_container_width=True)
 
 
-def brand_header(title: str, subtitle: str = "") -> None:
-    logo_col, text_col = st.columns([1, 6])
-    with logo_col:
-        if LOGO_PATH.exists():
-            st.image(str(LOGO_PATH), use_container_width=True)
-        else:
-            st.markdown(
-                '<div style="background:#355E3B;color:#fff;border-radius:8px;padding:14px 6px;'
-                'text-align:center;font-weight:700;letter-spacing:.05em;">USERVE</div>',
-                unsafe_allow_html=True,
-            )
-    with text_col:
-        st.markdown(f'<h1 style="color:#1F3B25;margin-bottom:0;">{title}</h1>', unsafe_allow_html=True)
-        if subtitle:
-            st.caption(subtitle)
+def server_view():
+    token = st.query_params.get("token", "") or st.session_state.get("server_token", "")
+    st.markdown('<div class="hero"><h1>Contractor Service Review</h1><p>Temporary read-only review session</p></div>', unsafe_allow_html=True)
+    if not token:
+        token = st.text_input("Access token", type="password")
+        if st.button("Open review", type="primary") and token:
+            st.session_state.server_token = token.strip()
+            st.rerun()
+        return
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    rows = q("SELECT t.*, a.payload, a.score, a.tier, a.audit_date FROM server_tokens t JOIN audits a ON a.id=t.audit_id WHERE t.token_hash=?", (token_hash,))
+    if not rows or rows[0]["ended"] or datetime.fromisoformat(rows[0]["expires_at"]) < datetime.utcnow():
+        st.error("This link is invalid, expired, or has ended.")
+        return
+    review = json.loads(rows[0]["payload"])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Score", rows[0]["score"]); c2.metric("Status", rows[0]["tier"]); c3.metric("Review date", rows[0]["audit_date"])
+    st.subheader("Performance breakdown")
+    st.dataframe(pd.DataFrame([{"Category": key, "Points": value if value is not None else "N/M"} for key, value in review["scores"].items()]), hide_index=True, use_container_width=True)
+    st.subheader("Urgent jobs")
+    st.dataframe(pd.DataFrame(review["urgent"]), hide_index=True, use_container_width=True)
+    st.subheader("Recommendations")
+    for item in review["recommendations"]: st.info(item)
+    if st.button("End my view"):
+        run("UPDATE server_tokens SET ended=1 WHERE token_hash=?", (token_hash,)); st.session_state.pop("server_token", None); st.rerun()
 
 
-def score_reports(frames: list[pd.DataFrame]) -> tuple[dict, pd.DataFrame]:
-    data = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-    if data.empty:
-        return {"score": 0, "completion": None, "first_rate": None, "speed": None, "quality": None, "events": [], "warnings": ["No usable records were found."], "rows": 0}, data
-    status_col = column(data, "job status", "status", "service code")
-    assigned_col = column(data, "date given to server", "date assigned", "date assigned/ received", "job recieved by server")
-    served_col = column(data, "date served")
-    court_col = column(data, "court date", "court date-time")
-    attempts_col = column(data, "attempts")
-    total_col = column(data, "total attempts")
-    clean = data.dropna(how="all").copy()
-    statuses = clean[status_col].map(normal) if status_col else pd.Series("", index=clean.index)
-    completed = statuses.str.contains(r"served|completed|returned|non-serve", regex=True, na=False)
-    served = statuses.str.contains(r"^served|completed", regex=True, na=False)
-    # Open inventory reports can lack statuses; they must never be counted as completed service.
-    completion = (served[completed].mean() * 100) if completed.any() else None
-    assigned = clean[assigned_col].map(parse_date) if assigned_col else pd.Series([None] * len(clean))
-    served_dates = clean[served_col].map(parse_date) if served_col else pd.Series([None] * len(clean))
-    intervals = [(end - start).days for start, end in zip(assigned, served_dates) if start and end and end >= start]
-    speed = sum(intervals) / len(intervals) if intervals else None
-    event_sets = clean[attempts_col].map(attempts_from_text) if attempts_col else pd.Series([[] for _ in range(len(clean))])
-    events = [event for group in event_sets for event in group]
-    timely = [min(group) - assigned.iloc[idx] for idx, group in enumerate(event_sets) if group and assigned.iloc[idx]]
-    first_rate = (sum(item <= timedelta(days=3) for item in timely) / len(timely) * 100) if timely else None
-    coverage = classify_attempts(events)
-    unable = statuses.str.contains("unablecontact|unable contact|avoiding|time", regex=True, na=False)
-    required = 0
-    compliant = 0
-    for idx in clean[unable].index:
-        if court_col and assigned_col:
-            court, given = parse_date(clean.at[idx, court_col]), parse_date(clean.at[idx, assigned_col])
-            if court and given and (court - given).days < 5:
-                continue
-        required += 1
-        attempts = event_sets.loc[idx] if idx in event_sets.index else []
-        parts = classify_attempts(attempts)
-        if len(attempts) >= 5 and parts["Morning (7–9 AM)"] and parts["Daytime (9 AM–5:30 PM)"] and parts["Evening (5:30–9 PM)"] and parts["Weekend"]:
-            compliant += 1
-    quality = compliant / required * 100 if required else None
-    # 100-point score. N/M categories are excluded, rather than treated as zero.
-    parts: list[tuple[float, float]] = []
-    if completion is not None: parts.append((25, min(25, max(0, completion / 65 * 25))))
-    if first_rate is not None: parts.append((15, first_rate / 100 * 15))
-    if quality is not None: parts.append((20, quality / 100 * 20))
-    if speed is not None: parts.append((10, max(0, min(10, (15 - speed) / 15 * 10))))
-    if events: parts.append((10, min(10, (coverage["Morning (7–9 AM)"] > 0) * 2.5 + (coverage["Daytime (9 AM–5:30 PM)"] > 0) * 2.5 + (coverage["Evening (5:30–9 PM)"] > 0) * 2.5 + (coverage["Weekend"] > 0) * 2.5)))
-    score = sum(points for _, points in parts) / sum(maximum for maximum, _ in parts) * 100 if parts else 0
-    warnings = []
-    if completion is None: warnings.append("No completed or returned jobs were identified; open jobs are excluded from completion rate.")
-    if not events: warnings.append("No dated attempt entries were found in the Attempts column.")
-    if required and quality is not None and quality < 100: warnings.append(f"{required - compliant} non-serve return(s) do not meet the five-attempt coverage requirement.")
-    return {"score": round(score, 1), "completion": completion, "first_rate": first_rate, "speed": speed, "quality": quality, "events": events, "coverage": coverage, "warnings": warnings, "rows": len(clean), "completed": int(completed.sum()), "served": int(served.sum())}, clean
+if st.query_params.get("view") == "server":
+    server_view(); st.stop()
 
+with st.sidebar:
+    st.markdown('<div class="brand-box">', unsafe_allow_html=True); logo(); st.markdown('</div>', unsafe_allow_html=True)
+    st.caption("Weekly Contractor Service Reviews")
 
-def add_server_form() -> None:
+servers = q("SELECT * FROM servers ORDER BY active DESC, name")
+if not servers:
+    run("INSERT INTO servers(name,company,active,frequency,audit_day,audit_time,created_at) VALUES(?,?,?,?,?,?,?)", ("Liz Mills", "", 1, "weekly", "Monday", "09:00", now_iso()))
+    servers = q("SELECT * FROM servers ORDER BY name")
+
+server_names = [row["name"] for row in servers]
+selected_name = st.sidebar.selectbox("Contractor", server_names)
+server = next(row for row in servers if row["name"] == selected_name)
+
+st.markdown(f'<div class="hero"><h1>{server["name"]}</h1><p>{APP_TITLE} · {server["frequency"].title()} review</p></div>', unsafe_allow_html=True)
+tabs = st.tabs(["Service Audit", "Reports", "Management", "History", "Server View"])
+
+reports = current_reports(server["id"])
+review = st.session_state.get(f"review_{server['id']}")
+
+with tabs[1]:
+    st.subheader("Add reports")
+    left, right = st.columns([1.2, 1])
+    with left:
+        chosen_type = st.selectbox("Report type", REPORT_TYPES + ["Auto-detect"])
+        pasted = st.text_area("Paste report", height=240, placeholder="Paste the complete report, including column headings…")
+        if st.button("Add pasted report", type="primary", disabled=not pasted.strip()):
+            report_type = detect_report(pasted) if chosen_type == "Auto-detect" else chosen_type
+            if report_type == "Needs mapping": st.error("The report type could not be recognized. Select it manually.")
+            else:
+                run("INSERT INTO reports(server_id,report_type,content,filename,imported_at) VALUES(?,?,?,?,?)", (server["id"], report_type, pasted, "Pasted report", now_iso())); st.success(f"{report_type} received."); st.rerun()
+    with right:
+        uploads = st.file_uploader("Upload CSV or Excel files", type=["csv", "tsv", "xlsx", "xls"], accept_multiple_files=True)
+        if uploads and st.button("Add uploaded files"):
+            for upload in uploads:
+                text = file_to_text(upload); report_type = detect_report(text, upload.name)
+                run("INSERT INTO reports(server_id,report_type,content,filename,imported_at) VALUES(?,?,?,?,?)", (server["id"], report_type, text, upload.name, now_iso()))
+            st.success(f"{len(uploads)} file(s) received."); st.rerun()
+    reports = current_reports(server["id"])
+    st.subheader("Reports in this review")
+    for report_type in REPORT_TYPES:
+        if report_type in reports:
+            row = reports[report_type]
+            c1, c2, c3 = st.columns([3, 2, 1]); c1.success(report_type); c2.caption(f"{row['filename']} · {row['imported_at']}")
+            if c3.button("Remove", key=f"remove_{row['id']}"): run("DELETE FROM reports WHERE id=?", (row["id"],)); st.rerun()
+        else: st.caption(f"○ {report_type}{' — required' if report_type in REQUIRED_REPORTS else ' — optional'}")
+    ready = all(item in reports for item in REQUIRED_REPORTS)
+    if st.button("Run Contractor Service Review", type="primary", disabled=not ready):
+        st.session_state[f"review_{server['id']}"] = build_review(reports); st.success("Review calculated. Open Service Audit."); st.rerun()
+
+with tabs[0]:
+    review = st.session_state.get(f"review_{server['id']}")
+    if not review:
+        st.info("Add the three required reports and run the Contractor Service Review from the Reports tab.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Overall score", review["score"]); c2.metric("Status", review["tier"]); c3.metric("Completion", f"{review['completion']:.1f}%"); c4.metric("Open priorities", len(review["urgent"]))
+        st.subheader("Performance breakdown")
+        st.dataframe(pd.DataFrame([{"Category": key, "Points": round(value,1) if value is not None else "N/M"} for key, value in review["scores"].items()]), hide_index=True, use_container_width=True)
+        st.subheader("Reconciliation")
+        issues = review["reconciliation"]
+        if issues:
+            st.warning(f"{len(issues)} reconciliation issue(s) found. The score remains provisional until reviewed.")
+            st.dataframe(pd.DataFrame(issues).rename(columns={"job_id":"Job ID","servee":"Servee","issue":"Reconciliation issue","expected":"Expected","found":"Found"}), hide_index=True, use_container_width=True)
+        else: st.success("Attempt counts reconcile across reports.")
+        if review["duplicate_issues"]:
+            with st.expander(f"Cross-job duplicate timestamps · {len(review['duplicate_issues'])}"):
+                st.dataframe(pd.DataFrame(review["duplicate_issues"]), hide_index=True, use_container_width=True)
+        st.subheader("Urgent jobs")
+        urgent_frame = pd.DataFrame(review["urgent"])
+        st.dataframe(urgent_frame, hide_index=True, use_container_width=True) if not urgent_frame.empty else st.success("No urgent jobs identified.")
+        st.subheader("Last seven days")
+        activity = pd.DataFrame(review["activity"])
+        if not activity.empty:
+            chart = activity.groupby(["Date","Window"], as_index=False)["Events"].sum(); st.plotly_chart(px.bar(chart, x="Date", y="Events", color="Window", barmode="stack"), use_container_width=True)
+        else: st.caption("No dated activity was recorded in the last seven days.")
+        st.subheader("Reviewer guidance")
+        for item in review["recommendations"] or ["No immediate performance recommendation generated."]: st.info(item)
+        complete = st.checkbox("Mark this audit complete")
+        if st.button("Save audit to history", type="primary"):
+            run("INSERT INTO audits(server_id,audit_date,score,tier,payload,completed,created_at) VALUES(?,?,?,?,?,?,?)", (server["id"], str(date.today()), review["score"], review["tier"], json.dumps(review, default=str), int(complete), now_iso())); st.success("Audit saved to history.")
+
+with tabs[2]:
+    st.subheader("Contractor roster and audit schedule")
     with st.expander("Add contractor", expanded=False):
-        with st.form("add_server", clear_on_submit=True):
-            name = st.text_input("Contractor / server name *")
-            company, territory = st.columns(2)
-            company_value = company.text_input("Company")
-            territory_value = territory.text_input("Territory")
-            audit_day, audit_time = st.columns(2)
-            day_value = audit_day.selectbox("Weekly audit day", WEEK_DAYS)
-            time_value = audit_time.time_input("Audit time", value=datetime.strptime("09:00", "%H:%M").time())
-            if st.form_submit_button("Add active contractor"):
-                if not name.strip(): st.error("A contractor name is required.")
-                else:
-                    try:
-                        execute("INSERT INTO servers (name, company, territory, audit_day, audit_time, active) VALUES (%s, %s, %s, %s, %s, TRUE)", (name.strip(), company_value.strip(), territory_value.strip(), WEEK_DAYS.index(day_value), time_value.strftime("%H:%M")))
-                        st.success(f"Added {name.strip()}.")
-                    except psycopg2.IntegrityError: st.error("That contractor is already in the roster.")
+        with st.form("add_server"):
+            name = st.text_input("Contractor name"); company = st.text_input("Company")
+            frequency = st.selectbox("Review frequency", ["weekly","biweekly","monthly"]); day = st.selectbox("Review day", ["Monday","Tuesday","Wednesday","Thursday","Friday"]); when = st.time_input("Review time")
+            if st.form_submit_button("Add contractor") and name.strip():
+                try: run("INSERT INTO servers(name,company,active,frequency,audit_day,audit_time,created_at) VALUES(?,?,?,?,?,?,?)", (name.strip(), company.strip(), 1, frequency, day, when.strftime("%H:%M"), now_iso())); st.success("Contractor added."); st.rerun()
+                except Exception: st.error("That contractor already exists.")
+    roster = pd.DataFrame(q("SELECT id,name,company,active,frequency,audit_day,audit_time FROM servers ORDER BY active DESC,name"))
+    st.dataframe(roster, hide_index=True, use_container_width=True)
+    c1, c2, c3 = st.columns(3)
+    if c1.button("Mark selected inactive"): run("UPDATE servers SET active=0 WHERE id=?", (server["id"],)); st.rerun()
+    if c2.button("Mark selected active"): run("UPDATE servers SET active=1 WHERE id=?", (server["id"],)); st.rerun()
+    if c3.button("Delete selected contractor"):
+        run("DELETE FROM reports WHERE server_id=?", (server["id"],)); run("DELETE FROM audits WHERE server_id=?", (server["id"],)); run("DELETE FROM servers WHERE id=?", (server["id"],)); st.rerun()
+    st.subheader("Audits due")
+    due = q("SELECT s.* FROM servers s WHERE active=1 ORDER BY audit_day,audit_time")
+    completed_this_week = {row["server_id"] for row in q("SELECT server_id FROM audits WHERE completed=1 AND audit_date>=?", ((date.today()-timedelta(days=date.today().weekday())).isoformat(),))}
+    due_frame = pd.DataFrame([{**row, "status": "Complete" if row["id"] in completed_this_week else "Due"} for row in due])
+    st.dataframe(due_frame[["name","frequency","audit_day","audit_time","status"]] if not due_frame.empty else due_frame, hide_index=True, use_container_width=True)
 
+with tabs[3]:
+    st.subheader("Saved audit history")
+    audits = q("SELECT a.*,s.name FROM audits a JOIN servers s ON s.id=a.server_id WHERE a.server_id=? ORDER BY a.id DESC", (server["id"],))
+    if not audits: st.info("No saved audits for this contractor yet.")
+    for audit in audits:
+        with st.expander(f"{audit['audit_date']} · {audit['score']} · {audit['tier']}"):
+            payload = json.loads(audit["payload"]); st.json({"score":payload["score"],"tier":payload["tier"],"completion":payload["completion"],"recommendations":payload["recommendations"]})
+            if st.button("Delete this audit", key=f"delete_audit_{audit['id']}"): run("DELETE FROM server_tokens WHERE audit_id=?", (audit["id"],)); run("DELETE FROM audits WHERE id=?", (audit["id"],)); st.rerun()
+    if len(audits) > 1:
+        trend = pd.DataFrame([{"Date": row["audit_date"], "Score": row["score"]} for row in reversed(audits)]); st.plotly_chart(px.line(trend, x="Date", y="Score", markers=True), use_container_width=True)
 
-def service_audit(servers: list[dict]) -> None:
-    brand_header("Service Audit", "Review one accepted-assignment portfolio. Scores reflect documented results; open jobs do not count as completed services.")
-    if not servers:
-        st.info("Add a contractor in Management before beginning an audit.")
-        return
-    selected = st.selectbox("Contractor", servers, format_func=lambda x: f"{x['name']}{' · ' + x['territory'] if x['territory'] else ''}")
-    token_note, token_button = st.columns([3, 1])
-    token_note.caption("Generate a one-time access code so this contractor can view this review live, during the audit.")
-    if token_button.button("Generate access code", key=f"gen-token-{selected['id']}"):
-        code, expires = generate_server_token(selected["id"])
-        st.session_state[f"latest_token_{selected['id']}"] = (code, expires)
-    latest = st.session_state.get(f"latest_token_{selected['id']}")
-    if latest:
-        code, expires = latest
-        remaining = expires - datetime.now()
-        if remaining.total_seconds() > 0:
-            st.info(f"Access code for {selected['name']}: **{code}** · valid for {int(remaining.total_seconds() // 60)} more minute(s), single use.")
-        else:
-            st.session_state.pop(f"latest_token_{selected['id']}", None)
-    files = st.file_uploader("Upload the 90-day CSV report(s)", type=["csv"], accept_multiple_files=True, help="Upload the Weekly Server Audit Upload Report and any Server Performance or Server Status CSVs.")
-    frames = []
-    rejected = []
-    for file in files or []:
-        try:
-            frame = pd.read_csv(file, dtype=str, keep_default_na=False)
-            frames.append(frame)
-        except Exception as error:
-            rejected.append(f"{file.name}: {error}")
-    if rejected:
-        st.error("Some files could not be read: " + " | ".join(rejected))
-    if not frames:
-        st.info("Upload one or more CSV reports to calculate this review.")
-        return
-    result, cleaned = score_reports(frames)
-    st.caption(f"{result['rows']:,} usable source rows · {result['completed']:,} completed/returned jobs considered · {len(result['events']):,} dated attempt events")
-    cols = st.columns(5)
-    cols[0].metric("Overall score", f"{result['score']:.1f}/100")
-    cols[0].markdown(tier_badge_html(result['score']), unsafe_allow_html=True)
-    cols[1].metric("Completion rate", "N/M" if result['completion'] is None else f"{result['completion']:.1f}%", "65% standard")
-    cols[2].metric("First attempt ≤3 days", "N/M" if result['first_rate'] is None else f"{result['first_rate']:.1f}%")
-    cols[3].metric("Non-serve attempt quality", "N/M" if result['quality'] is None else f"{result['quality']:.1f}%")
-    cols[4].metric("Average days to service", "N/M" if result['speed'] is None else f"{result['speed']:.1f}")
-    if result.get("coverage"):
-        st.subheader("Attempt coverage")
-        st.bar_chart(pd.DataFrame({"attempts": result["coverage"]}))
-    for warning in result["warnings"]:
-        st.warning(warning)
-    st.subheader("Auditor discussion points")
-    if result['completion'] is not None and result['completion'] < 65: st.error("Completion is below the 65% acceptable rate. Review territory fit, documentation and replacement risk.")
-    if result['first_rate'] is not None and result['first_rate'] < 80: st.warning("Improve initial attempts: accepted assignments should receive a first attempt within three business days unless earlier action is required.")
-    if result.get("coverage", {}).get("Evening (5:30–9 PM)", 0) == 0 or result.get("coverage", {}).get("Weekend", 0) == 0: st.warning("Coverage is limited. Discuss independently adding evening and Saturday attempts where appropriate.")
-    st.subheader("Urgent jobs")
-    court = column(cleaned, "court date", "court date-time")
-    job = column(cleaned, "job id", "jobid")
-    name = column(cleaned, "servee name", "defendant")
-    urgent_jobs: list[dict] = []
-    if court:
-        urgency = cleaned.copy()
-        urgency["_court"] = urgency[court].map(parse_date)
-        cutoff = datetime.now() + timedelta(days=10)
-        urgency = urgency[urgency["_court"].notna() & (urgency["_court"] <= cutoff)].sort_values("_court")
-        if len(urgency):
-            urgent_view = urgency[[c for c in [job, name, court] if c]].head(100)
-            st.dataframe(urgent_view, use_container_width=True, hide_index=True)
-            urgent_jobs = urgent_view.to_dict("records")
-        else: st.success("No reported court dates are within the next 10 days.")
-    else: st.info("Court-date field not found in the uploaded reports.")
-    note = st.text_area("Audit note / reconciliation explanation")
-    save_live_audit(selected["id"], {
-        "score": result["score"], "tier": tier(result["score"]),
-        "completion": result["completion"], "first_rate": result["first_rate"],
-        "quality": result["quality"], "speed": result["speed"],
-        "coverage": result["coverage"], "warnings": result["warnings"],
-        "note": note, "urgent_jobs": urgent_jobs,
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    })
-    if st.button("Archive this weekly review", type="primary"):
-        execute("INSERT INTO reviews (server_id, review_date, completion_rate, score, tier, first_attempt_rate, average_days_to_service, attempt_quality, report_notes) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", (selected["id"], date.today().isoformat(), result["completion"], result["score"], tier(result["score"]), result["first_rate"], result["speed"], result["quality"], note))
-        execute("INSERT INTO audit_completions (server_id, week_start) VALUES (%s, %s) ON CONFLICT (server_id, week_start) DO NOTHING", (selected["id"], current_week().isoformat()))
-        st.success("Weekly review archived. The contractor has been removed from this week's audit queue.")
-
-
-def management() -> None:
-    brand_header("Management", "Schedule weekly contractor reviews, manage the roster, monitor trends, and remove an incorrect saved audit when necessary.")
-    add_server_form()
-    servers = rows("SELECT * FROM servers ORDER BY active DESC, audit_day, audit_time, name")
-    active = [server for server in servers if server["active"]]
-    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = %s", (current_week().isoformat(),))}
-    queue = [server for server in active if server["id"] not in completed_ids]
-    a, b, c = st.columns(3)
-    a.metric("Active contractors", len(active))
-    b.metric("Completed this week", len(completed_ids))
-    c.metric("Still to review", len(queue))
-    st.subheader("This week's scheduled audit queue")
-    if queue:
-        for server in queue:
-            left, middle, right = st.columns([4, 2, 1])
-            left.write(f"**{server['name']}**  \n{server['company'] or 'Independent contractor'}")
-            middle.write(f"{WEEK_DAYS[server['audit_day']]} · {server['audit_time']}")
-            if right.button("Complete", key=f"complete-{server['id']}"):
-                execute("INSERT INTO audit_completions (server_id, week_start) VALUES (%s, %s) ON CONFLICT (server_id, week_start) DO NOTHING", (server["id"], current_week().isoformat()))
-                st.rerun()
-    else: st.success("All active contractors are complete for this week.")
-    st.subheader("Contractor roster")
-    for server in servers:
-        with st.expander(f"{server['name']} · {'Active' if server['active'] else 'Inactive'}"):
-            st.write(f"{server['company'] or 'Independent contractor'}")
-            one, two, three = st.columns(3)
-            if one.button("Mark inactive" if server['active'] else "Reactivate", key=f"active-{server['id']}"):
-                execute("UPDATE servers SET active = %s WHERE id = %s", (not server["active"], server["id"]))
-                st.rerun()
-            if server['id'] in completed_ids and two.button("Undo completion", key=f"undo-{server['id']}"):
-                execute("DELETE FROM audit_completions WHERE server_id = %s AND week_start = %s", (server["id"], current_week().isoformat()))
-                st.rerun()
-    st.subheader("Portfolio performance and saved audit history")
-    reviews = rows("SELECT r.*, s.name FROM reviews r JOIN servers s ON s.id = r.server_id ORDER BY r.review_date DESC, r.created_at DESC")
-    if reviews:
-        frame = pd.DataFrame(reviews)
-        st.dataframe(frame[["review_date", "name", "score", "tier", "completion_rate", "first_attempt_rate", "average_days_to_service"]], use_container_width=True, hide_index=True)
-        trends = frame.copy(); trends["review_date"] = pd.to_datetime(trends["review_date"])
-        st.line_chart(trends.pivot_table(index="review_date", columns="name", values="score", aggfunc="last"))
-        st.subheader("Delete incorrect saved audit")
-        review_options = {f"{r['review_date']} — {r['name']} — {r['score']:.1f}": r for r in reviews}
-        delete_choice = st.selectbox("Saved audit", list(review_options))
-        if st.button("Delete selected saved audit", type="secondary"):
-            execute("DELETE FROM reviews WHERE id = %s", (review_options[delete_choice]["id"],))
-            st.success("Saved audit deleted."); st.rerun()
-    else: st.info("No weekly reviews have been archived yet.")
-
-
-def contractor_login() -> None:
-    brand_header("Contractor Access", "Enter the one-time access code your auditor gave you to view your current weekly review.")
-    with st.form("contractor_login_form", clear_on_submit=True):
-        code = st.text_input("Access code", max_chars=12)
-        submitted = st.form_submit_button("View my review")
-    if submitted:
-        if not code.strip():
-            st.error("Enter the access code your auditor gave you.")
-            return
-        token = consume_server_token(code)
-        if not token:
-            st.error("That code is invalid or has expired. Ask your auditor to generate a new one.")
-            return
-        st.session_state["server_session"] = {
-            "server_id": token["server_id"],
-            "expires_at": token["expires_at"],
-        }
-        st.rerun()
-
-
-def contractor_session_view(server_session: dict) -> None:
-    server_id = server_session["server_id"]
-    expires_at = datetime.fromisoformat(server_session["expires_at"])
-    remaining = expires_at - datetime.now()
-    server_rows = rows("SELECT * FROM servers WHERE id = %s", (server_id,))
-    server = server_rows[0] if server_rows else None
-    if not server:
-        brand_header("Your Current Weekly Review")
-        st.error("This contractor record could not be found. Ask your auditor for a new code.")
-        st.session_state.pop("server_session", None)
-        return
-    brand_header("Your Current Weekly Review", f"{server['name']}{' · ' + server['territory'] if server['territory'] else ''}")
-    if st_autorefresh is not None:
-        st_autorefresh(interval=30_000, key="contractor_live_refresh")
-    top1, top2, top3 = st.columns([2, 1, 1])
-    top1.info(f"Session active · expires in {max(0, int(remaining.total_seconds() // 60))}m {max(0, int(remaining.total_seconds() % 60))}s")
-    if top2.button("Refresh"):
-        st.rerun()
-    if top3.button("End session"):
-        st.session_state.pop("server_session", None)
-        st.rerun()
-    snap = load_live_audit(server_id)
-    if not snap:
-        st.info("Your auditor hasn't uploaded any reports for this week's review yet. Check back soon.")
-        return
-    st.caption(f"Last updated {snap['generated_at']}")
-    cols = st.columns(5)
-    cols[0].metric("Overall score", f"{snap['score']:.1f}/100")
-    cols[0].markdown(tier_badge_html(snap['score']), unsafe_allow_html=True)
-    cols[1].metric("Completion rate", "N/M" if snap['completion'] is None else f"{snap['completion']:.1f}%", "65% standard")
-    cols[2].metric("First attempt ≤3 days", "N/M" if snap['first_rate'] is None else f"{snap['first_rate']:.1f}%")
-    cols[3].metric("Non-serve attempt quality", "N/M" if snap['quality'] is None else f"{snap['quality']:.1f}%")
-    cols[4].metric("Average days to service", "N/M" if snap['speed'] is None else f"{snap['speed']:.1f}")
-    if snap.get("coverage"):
-        st.subheader("Attempt coverage")
-        st.bar_chart(pd.DataFrame({"attempts": snap["coverage"]}))
-    for warning in snap["warnings"]:
-        st.warning(warning)
-    st.subheader("Urgent jobs")
-    if snap.get("urgent_jobs"):
-        st.dataframe(pd.DataFrame(snap["urgent_jobs"]), use_container_width=True, hide_index=True)
-    else:
-        st.success("No reported court dates are within the next 10 days.")
-    st.subheader("Auditor note")
-    st.write(snap.get("note") or "No note recorded yet.")
-
-
-def dashboard() -> None:
-    brand_header("Dashboard", "This week's audit progress and combined urgent jobs across all in-progress reviews.")
-    servers = rows("SELECT * FROM servers WHERE active = TRUE ORDER BY name")
-    completed_ids = {item["server_id"] for item in rows("SELECT server_id FROM audit_completions WHERE week_start = %s", (current_week().isoformat(),))}
-    a, b, c = st.columns(3)
-    a.metric("Active contractors", len(servers))
-    b.metric("Completed this week", len(completed_ids))
-    c.metric("Still to review", len(servers) - len(completed_ids))
-    st.subheader("Combined urgent jobs (next 10 days)")
-    combined = []
-    for server in servers:
-        snap = load_live_audit(server["id"])
-        if snap and snap.get("urgent_jobs"):
-            for job in snap["urgent_jobs"]:
-                combined.append({"Contractor": server["name"], **job})
-    if combined:
-        st.dataframe(pd.DataFrame(combined), use_container_width=True, hide_index=True)
-    else:
-        st.info("No urgent jobs have been recorded yet from this week's in-progress audits. Urgent jobs appear here as soon as an auditor uploads CSVs for a contractor in Service Audit.")
-
-
-def main() -> None:
-    st.set_page_config(page_title="UServe Contractor Service Review", page_icon="US", layout="wide")
-    inject_theme()
-    setup()
-    server_session = st.session_state.get("server_session")
-    if server_session:
-        if datetime.now() < datetime.fromisoformat(server_session["expires_at"]):
-            contractor_session_view(server_session)
-            return
-        st.session_state.pop("server_session", None)
-        st.warning("Your session has expired. Ask your auditor for a new access code.")
-    if LOGO_PATH.exists():
-        st.sidebar.image(str(LOGO_PATH), use_container_width=True)
-    else:
-        st.sidebar.title("UServe")
-    st.sidebar.caption("Contractor Service Review Console")
-    section = st.sidebar.radio("Workspace", ["Dashboard", "Service Audit", "Management", "Contractor Login"])
-    st.sidebar.divider()
-    st.sidebar.caption("90-day review window · 65% completion standard")
-    if section == "Dashboard": dashboard()
-    elif section == "Service Audit": service_audit(rows("SELECT * FROM servers WHERE active = TRUE ORDER BY name"))
-    elif section == "Management": management()
-    else: contractor_login()
-
-
-if __name__ == "__main__":
-    main()
+with tabs[4]:
+    st.subheader("Temporary contractor view")
+    audits = q("SELECT * FROM audits WHERE server_id=? ORDER BY id DESC LIMIT 1", (server["id"],))
+    if not audits: st.info("Save an audit before generating a contractor view.")
+    elif st.button("Generate 15-minute token", type="primary"):
+        token = secrets.token_urlsafe(18); token_hash = hashlib.sha256(token.encode()).hexdigest(); expires = datetime.utcnow() + timedelta(minutes=15)
+        run("INSERT INTO server_tokens(token_hash,audit_id,expires_at,ended) VALUES(?,?,?,0)", (token_hash, audits[0]["id"], expires.isoformat()))
+        st.code(token); st.code(f"?view=server&token={token}"); st.caption("Append the displayed query string to this app’s public URL. The session expires after 15 minutes.")
