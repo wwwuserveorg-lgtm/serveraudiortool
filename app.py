@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+from urllib.parse import urlencode
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ try:
     DB_URL = st.secrets.get("DATABASE_URL", os.getenv("DATABASE_URL", ""))
 except Exception:
     DB_URL = os.getenv("DATABASE_URL", "")
+try:
+    PUBLIC_APP_URL = str(st.secrets.get("PUBLIC_APP_URL", os.getenv("PUBLIC_APP_URL", ""))).strip().rstrip("/")
+except Exception:
+    PUBLIC_APP_URL = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
 REQUIRED_REPORTS = ["Jobs with attempts", "Jobs with no attempts", "Historical job detail"]
 REPORT_TYPES = REQUIRED_REPORTS + ["Server performance", "Daily activity log"]
 
@@ -78,8 +83,9 @@ def init_db():
     statements = [
         """CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, company TEXT DEFAULT '', active INTEGER DEFAULT 1, frequency TEXT DEFAULT 'weekly', audit_day TEXT DEFAULT 'Monday', audit_time TEXT DEFAULT '09:00', created_at TEXT NOT NULL)""",
         """CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, report_type TEXT NOT NULL, content TEXT NOT NULL, filename TEXT DEFAULT '', imported_at TEXT NOT NULL)""",
-        """CREATE TABLE IF NOT EXISTS audits (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, audit_date TEXT NOT NULL, score REAL NOT NULL, tier TEXT NOT NULL, payload TEXT NOT NULL, completed INTEGER DEFAULT 0, created_at TEXT NOT NULL)""",
-        """CREATE TABLE IF NOT EXISTS server_tokens (token_hash TEXT PRIMARY KEY, audit_id INTEGER NOT NULL, expires_at TEXT NOT NULL, ended INTEGER DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS audits (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, audit_date TEXT NOT NULL, score REAL NOT NULL, tier TEXT NOT NULL, payload TEXT NOT NULL, completed INTEGER DEFAULT 0, reviewer_notes TEXT DEFAULT '', shared_notes TEXT DEFAULT '', audit_status TEXT DEFAULT 'draft', completed_at TEXT DEFAULT '', updated_at TEXT DEFAULT '', created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS server_tokens (token_hash TEXT PRIMARY KEY, audit_id INTEGER NOT NULL, expires_at TEXT NOT NULL, ended INTEGER DEFAULT 0, created_at TEXT DEFAULT '')""",
+        """CREATE TABLE IF NOT EXISTS followup_notes (id INTEGER PRIMARY KEY, server_id INTEGER NOT NULL, note TEXT NOT NULL, status TEXT DEFAULT 'open', created_by TEXT DEFAULT '', source_audit_id INTEGER, created_at TEXT NOT NULL, closed_at TEXT DEFAULT '', closed_by TEXT DEFAULT '')""",
     ]
     try:
         for statement in statements:
@@ -94,6 +100,32 @@ def init_db():
 
 
 init_db()
+
+
+def migrate_db():
+    """Add newer fields without deleting existing audits."""
+    additions = {
+        "audits": [
+            ("reviewer_notes", "TEXT DEFAULT ''"),
+            ("shared_notes", "TEXT DEFAULT ''"),
+            ("audit_status", "TEXT DEFAULT 'draft'"),
+            ("completed_at", "TEXT DEFAULT ''"),
+            ("updated_at", "TEXT DEFAULT ''"),
+        ],
+        "server_tokens": [("created_at", "TEXT DEFAULT ''")],
+    }
+    for table, columns in additions.items():
+        for column, definition in columns:
+            try:
+                run(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            except Exception:
+                pass
+
+
+def persistence_label() -> tuple[str, str]:
+    if DB_URL:
+        return "Permanent database connected", "success"
+    return "Temporary SQLite mode — history can be lost when Streamlit restarts", "warning"
 
 
 def read_sql(sql: str, params: tuple = ()) -> pd.DataFrame:
@@ -134,6 +166,9 @@ def run(sql: str, params: tuple = ()):
         conn.commit()
     finally:
         conn.close()
+
+
+migrate_db()
 
 
 def norm_col(value: Any) -> str:
@@ -181,37 +216,70 @@ def parse_attempts(value: Any) -> tuple[list[dict], list[str]]:
 
 
 def dataframe_from_text(text: str) -> pd.DataFrame:
-    text = text.strip()
+    text = clean_pasted_text(text)
     if not text:
         return pd.DataFrame()
     if text.startswith("["):
         return pd.DataFrame(json.loads(text))
-    for separator in ("\t", ","):
-        try:
-            frame = pd.read_csv(io.StringIO(text), sep=separator, dtype=str, keep_default_na=False, engine="python")
-            if len(frame.columns) > 1:
-                if norm_col(frame.columns[0]) in ("", "unnamed: 0"):
-                    frame = frame.iloc[:, 1:]
-                return frame
-        except Exception:
-            pass
+    lines = text.splitlines()
+    likely_headers = [0]
+    header_terms = ("job id", "jobid", "servee name", "year", "lawfirm file", "received date")
+    for index, line in enumerate(lines[:30]):
+        normalized = norm_col(line)
+        if sum(term in normalized for term in header_terms) >= 2 and index not in likely_headers:
+            likely_headers.append(index)
+    for start in likely_headers:
+        candidate = "\n".join(lines[start:])
+        for separator in ("\t", ",", "|"):
+            try:
+                frame = pd.read_csv(io.StringIO(candidate), sep=separator, dtype=str, keep_default_na=False, engine="python")
+                if len(frame.columns) > 1:
+                    if norm_col(frame.columns[0]) in ("", "unnamed: 0"):
+                        frame = frame.iloc[:, 1:]
+                    return frame
+            except Exception:
+                pass
     return pd.DataFrame()
 
 
+def clean_pasted_text(text: str) -> str:
+    return str(text or "").replace("\ufeff", "").replace("\u200b", "").replace("\xa0", " ").strip()
+
+
 def detect_report(text: str, filename: str = "") -> str:
-    low = text[:10000].lower()
+    text = clean_pasted_text(text)
+    low = re.sub(r"\s+", " ", text[:20000].lower())
     if "performance report results" in low or ("% served" in low and "assigned->serve" in low):
         return "Server performance"
     if "jobid:" in low and "status:" in low and "dt:" in low:
         return "Daily activity log"
     frame = dataframe_from_text(text)
     columns = {norm_col(column) for column in frame.columns}
-    if "attempts" in columns and ("date served" in columns or "job status" in columns):
+    joined_columns = " | ".join(sorted(columns))
+    if (
+        "attempts" in columns
+        and any(name in columns for name in ("date served", "service code", "non-serve code", "lawfirm file no", "job recieved by server"))
+    ) or ("lawfirm file" in joined_columns and "date served" in joined_columns and "attempts" in joined_columns):
         return "Historical job detail"
-    if any("total attempts" in column for column in columns):
+    if any("total attempts" in column for column in columns) or (
+        "last attempt days ago" in joined_columns and any(term in joined_columns for term in ("1st week", "morning", "evening", "weekend"))
+    ):
         return "Jobs with attempts"
-    if any("days from filing" in column for column in columns) or "first attempt: days prior to date received (attempts)" in columns:
+    if (
+        any("days from filing" in column for column in columns)
+        or any("days from received" in column for column in columns)
+        or any("first attempt: days prior" in column for column in columns)
+        or ("date assigned/ received/filed" in joined_columns and "court date" in joined_columns)
+    ):
         return "Jobs with no attempts"
+    # Fallback recognition for pasted reports whose rows are irregular but whose
+    # visible header is still identifiable.
+    if "total attempts" in low and "last attempt days ago" in low:
+        return "Jobs with attempts"
+    if "days from filing/ assign/receive" in low or "first attempt: days prior to date received" in low:
+        return "Jobs with no attempts"
+    if "date served" in low and "attempts" in low and ("service code" in low or "lawfirm file" in low):
+        return "Historical job detail"
     return "Historical job detail" if filename.lower().endswith((".csv", ".xlsx")) and "attempt" in low else "Needs mapping"
 
 
@@ -229,6 +297,43 @@ def current_reports(server_id: int) -> dict[str, dict]:
     for row in rows:
         result.setdefault(row["report_type"], row)
     return result
+
+
+def submit_pasted_report(server_id: int, text_key: str, type_key: str, message_key: str):
+    """Accept a pasted report and clear the widget only after a successful save."""
+    pasted = clean_pasted_text(st.session_state.get(text_key, ""))
+    chosen_type = st.session_state.get(type_key, "Auto-detect")
+    if not pasted:
+        st.session_state[message_key] = ("error", "Paste a report before submitting.")
+        return
+    report_type = detect_report(pasted) if chosen_type == "Auto-detect" else chosen_type
+    if report_type == "Needs mapping":
+        st.session_state[message_key] = (
+            "error",
+            "The report type could not be recognized. The pasted report was kept in the box—select its report type and submit again.",
+        )
+        return
+    run(
+        "INSERT INTO reports(server_id,report_type,content,filename,imported_at) VALUES(?,?,?,?,?)",
+        (server_id, report_type, pasted, "Pasted report", now_iso()),
+    )
+    st.session_state[text_key] = ""
+    st.session_state[message_key] = ("success", f"{report_type} received and saved.")
+
+
+def submit_followup_note(server_id: int, note_key: str, auditor: str, message_key: str):
+    note = str(st.session_state.get(note_key, "")).strip()
+    if not note:
+        st.session_state[message_key] = ("error", "Enter a note before saving.")
+        return
+    latest = q("SELECT id FROM audits WHERE server_id=? ORDER BY id DESC LIMIT 1", (server_id,))
+    source_audit_id = latest[0]["id"] if latest else None
+    run(
+        "INSERT INTO followup_notes(server_id,note,status,created_by,source_audit_id,created_at,closed_at,closed_by) VALUES(?,?,?,?,?,?,?,?)",
+        (server_id, note, "open", auditor, source_audit_id, now_iso(), "", ""),
+    )
+    st.session_state[note_key] = ""
+    st.session_state[message_key] = ("success", "Open note saved. It will appear on the next review until marked closed.")
 
 
 def historical_jobs(text: str) -> list[dict]:
@@ -393,7 +498,7 @@ def logo():
 
 
 def server_view():
-    token = st.query_params.get("token", "") or st.session_state.get("server_token", "")
+    token = str(st.query_params.get("token", "") or st.session_state.get("server_token", "")).strip()
     st.markdown('<div class="hero"><h1>Contractor Service Review</h1><p>Temporary read-only review session</p></div>', unsafe_allow_html=True)
     if not token:
         token = st.text_input("Access token", type="password")
@@ -402,7 +507,7 @@ def server_view():
             st.rerun()
         return
     token_hash = hashlib.sha256(token.encode()).hexdigest()
-    rows = q("SELECT t.*, a.payload, a.score, a.tier, a.audit_date FROM server_tokens t JOIN audits a ON a.id=t.audit_id WHERE t.token_hash=?", (token_hash,))
+    rows = q("SELECT t.*, a.payload, a.score, a.tier, a.audit_date, a.shared_notes, a.audit_status FROM server_tokens t JOIN audits a ON a.id=t.audit_id WHERE t.token_hash=?", (token_hash,))
     if not rows or rows[0]["ended"] or datetime.fromisoformat(rows[0]["expires_at"]) < datetime.utcnow():
         st.error("This link is invalid, expired, or has ended.")
         return
@@ -415,6 +520,11 @@ def server_view():
     st.dataframe(pd.DataFrame(review["urgent"]), hide_index=True, use_container_width=True)
     st.subheader("Recommendations")
     for item in review["recommendations"]: st.info(item)
+    if rows[0].get("shared_notes"):
+        st.subheader("Review notes")
+        st.write(rows[0]["shared_notes"])
+    if st.button("Refresh review"):
+        st.rerun()
     if st.button("End my view"):
         run("UPDATE server_tokens SET ended=1 WHERE token_hash=?", (token_hash,)); st.session_state.pop("server_token", None); st.rerun()
 
@@ -425,6 +535,9 @@ if st.query_params.get("view") == "server":
 with st.sidebar:
     st.markdown('<div class="brand-box">', unsafe_allow_html=True); logo(); st.markdown('</div>', unsafe_allow_html=True)
     st.caption("Weekly Contractor Service Reviews")
+    auditor_name = st.selectbox("Auditor", ["auditor1", "auditor2", "auditor3", "auditor4", "auditor5"], key="active_auditor")
+    persistence_text, persistence_kind = persistence_label()
+    getattr(st, persistence_kind)(persistence_text)
 
 servers = q("SELECT * FROM servers ORDER BY active DESC, name")
 if not servers:
@@ -445,20 +558,52 @@ with tabs[1]:
     st.subheader("Add reports")
     left, right = st.columns([1.2, 1])
     with left:
-        chosen_type = st.selectbox("Report type", REPORT_TYPES + ["Auto-detect"])
-        pasted = st.text_area("Paste report", height=240, placeholder="Paste the complete report, including column headings…")
-        if st.button("Add pasted report", type="primary", disabled=not pasted.strip()):
-            report_type = detect_report(pasted) if chosen_type == "Auto-detect" else chosen_type
-            if report_type == "Needs mapping": st.error("The report type could not be recognized. Select it manually.")
+        paste_type_key = f"paste_type_{server['id']}"
+        paste_text_key = f"paste_text_{server['id']}"
+        paste_message_key = f"paste_message_{server['id']}"
+        chosen_type = st.selectbox("Report type", ["Auto-detect"] + REPORT_TYPES, key=paste_type_key)
+        pasted = st.text_area(
+            "Paste report",
+            height=240,
+            placeholder="Paste the complete report, including column headings…",
+            key=paste_text_key,
+        )
+        if pasted.strip() and chosen_type == "Auto-detect":
+            detected_type = detect_report(pasted)
+            if detected_type == "Needs mapping":
+                st.warning("Type not recognized yet. Choose the report type above; your pasted text will remain in place.")
             else:
-                run("INSERT INTO reports(server_id,report_type,content,filename,imported_at) VALUES(?,?,?,?,?)", (server["id"], report_type, pasted, "Pasted report", now_iso())); st.success(f"{report_type} received."); st.rerun()
+                st.caption(f"Detected as: **{detected_type}**")
+        st.button(
+            "Add pasted report",
+            type="primary",
+            disabled=not pasted.strip(),
+            on_click=submit_pasted_report,
+            args=(server["id"], paste_text_key, paste_type_key, paste_message_key),
+        )
+        paste_message = st.session_state.pop(paste_message_key, None)
+        if paste_message:
+            getattr(st, paste_message[0])(paste_message[1])
     with right:
+        upload_type = st.selectbox("Uploaded-file report type", ["Auto-detect"] + REPORT_TYPES, key=f"upload_type_{server['id']}")
         uploads = st.file_uploader("Upload CSV or Excel files", type=["csv", "tsv", "xlsx", "xls"], accept_multiple_files=True)
         if uploads and st.button("Add uploaded files"):
+            accepted = 0
+            unrecognized = []
             for upload in uploads:
-                text = file_to_text(upload); report_type = detect_report(text, upload.name)
+                text = file_to_text(upload)
+                report_type = detect_report(text, upload.name) if upload_type == "Auto-detect" else upload_type
+                if report_type == "Needs mapping":
+                    unrecognized.append(upload.name)
+                    continue
                 run("INSERT INTO reports(server_id,report_type,content,filename,imported_at) VALUES(?,?,?,?,?)", (server["id"], report_type, text, upload.name, now_iso()))
-            st.success(f"{len(uploads)} file(s) received."); st.rerun()
+                accepted += 1
+            if accepted:
+                st.success(f"{accepted} file(s) received.")
+            if unrecognized:
+                st.error("Not added because the report type was not recognized: " + ", ".join(unrecognized) + ". Select the report type and submit again.")
+            if accepted and not unrecognized:
+                st.rerun()
     reports = current_reports(server["id"])
     st.subheader("Reports in this review")
     for report_type in REPORT_TYPES:
@@ -499,9 +644,85 @@ with tabs[0]:
         else: st.caption("No dated activity was recorded in the last seven days.")
         st.subheader("Reviewer guidance")
         for item in review["recommendations"] or ["No immediate performance recommendation generated."]: st.info(item)
-        complete = st.checkbox("Mark this audit complete")
-        if st.button("Save audit to history", type="primary"):
-            run("INSERT INTO audits(server_id,audit_date,score,tier,payload,completed,created_at) VALUES(?,?,?,?,?,?,?)", (server["id"], str(date.today()), review["score"], review["tier"], json.dumps(review, default=str), int(complete), now_iso())); st.success("Audit saved to history.")
+        st.subheader("Open follow-up notes")
+        st.caption("These notes carry forward to every future review until an auditor marks them closed.")
+        open_notes = q("SELECT * FROM followup_notes WHERE server_id=? AND status='open' ORDER BY id", (server["id"],))
+        if not open_notes:
+            st.success("No open follow-up notes for this contractor.")
+        for note in open_notes:
+            note_text, note_action = st.columns([6, 1.2])
+            note_text.warning(f"{note['note']}\n\nOpened {note['created_at'][:10]} by {note.get('created_by') or 'auditor'}")
+            if note_action.button("Mark closed", key=f"close_followup_{note['id']}", use_container_width=True):
+                run("UPDATE followup_notes SET status='closed',closed_at=?,closed_by=? WHERE id=?", (now_iso(), auditor_name, note["id"]))
+                st.success("Note closed. It will not appear on the next audit.")
+                st.rerun()
+
+        followup_key = f"new_followup_{server['id']}"
+        followup_message_key = f"followup_message_{server['id']}"
+        st.text_area("Add an open note for this and future audits", key=followup_key, height=90)
+        st.button(
+            "Save open note",
+            type="primary",
+            on_click=submit_followup_note,
+            args=(server["id"], followup_key, auditor_name, followup_message_key),
+        )
+        followup_message = st.session_state.pop(followup_message_key, None)
+        if followup_message:
+            getattr(st, followup_message[0])(followup_message[1])
+        closed_notes = q("SELECT * FROM followup_notes WHERE server_id=? AND status='closed' ORDER BY id DESC", (server["id"],))
+        if closed_notes:
+            with st.expander(f"Closed follow-up notes ({len(closed_notes)})"):
+                st.dataframe(
+                    pd.DataFrame([{"Note": item["note"], "Opened": item["created_at"][:10], "Closed": (item.get("closed_at") or "")[:10], "Closed by": item.get("closed_by") or ""} for item in closed_notes]),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+        st.subheader("Current audit notes")
+        active_drafts = q("SELECT * FROM audits WHERE server_id=? AND completed=0 ORDER BY id DESC LIMIT 1", (server["id"],))
+        active_draft = active_drafts[0] if active_drafts else None
+        reviewer_notes = st.text_area(
+            "Internal auditor notes (not shown to contractor)",
+            value=(active_draft.get("reviewer_notes", "") if active_draft else ""),
+            height=130,
+            key=f"reviewer_notes_{server['id']}",
+        )
+        shared_notes = st.text_area(
+            "Call notes shared in Server View",
+            value=(active_draft.get("shared_notes", "") if active_draft else ""),
+            height=110,
+            key=f"shared_notes_{server['id']}",
+        )
+
+        def save_current_audit(mark_complete: bool):
+            stamp = now_iso()
+            payload = json.dumps(review, default=str)
+            if active_draft:
+                run(
+                    "UPDATE audits SET audit_date=?,score=?,tier=?,payload=?,completed=?,reviewer_notes=?,shared_notes=?,audit_status=?,completed_at=?,updated_at=? WHERE id=?",
+                    (str(date.today()), review["score"], review["tier"], payload, int(mark_complete), reviewer_notes, shared_notes, "completed" if mark_complete else "draft", stamp if mark_complete else "", stamp, active_draft["id"]),
+                )
+                return active_draft["id"]
+            run(
+                "INSERT INTO audits(server_id,audit_date,score,tier,payload,completed,reviewer_notes,shared_notes,audit_status,completed_at,updated_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (server["id"], str(date.today()), review["score"], review["tier"], payload, int(mark_complete), reviewer_notes, shared_notes, "completed" if mark_complete else "draft", stamp if mark_complete else "", stamp, stamp),
+            )
+            saved = q("SELECT id FROM audits WHERE server_id=? ORDER BY id DESC LIMIT 1", (server["id"],))
+            return saved[0]["id"] if saved else None
+
+        save_col, complete_col = st.columns(2)
+        if save_col.button("Save audit notes now", use_container_width=True):
+            save_current_audit(False)
+            st.success("Current audit and notes saved as a draft.")
+            st.rerun()
+        if complete_col.button("Complete audit and save", type="primary", use_container_width=True):
+            audit_id = save_current_audit(True)
+            if audit_id:
+                run("UPDATE server_tokens SET ended=1 WHERE audit_id=?", (audit_id,))
+            st.success("Audit completed, saved to history, and removed from the current due list.")
+            st.session_state.pop(f"reviewer_notes_{server['id']}", None)
+            st.session_state.pop(f"shared_notes_{server['id']}", None)
+            st.rerun()
 
 with tabs[2]:
     st.subheader("Contractor roster and audit schedule")
@@ -530,17 +751,39 @@ with tabs[3]:
     audits = q("SELECT a.*,s.name FROM audits a JOIN servers s ON s.id=a.server_id WHERE a.server_id=? ORDER BY a.id DESC", (server["id"],))
     if not audits: st.info("No saved audits for this contractor yet.")
     for audit in audits:
-        with st.expander(f"{audit['audit_date']} · {audit['score']} · {audit['tier']}"):
+        status = audit.get("audit_status") or ("completed" if audit.get("completed") else "draft")
+        with st.expander(f"{audit['audit_date']} · {audit['score']} · {audit['tier']} · {status.title()}"):
             payload = json.loads(audit["payload"]); st.json({"score":payload["score"],"tier":payload["tier"],"completion":payload["completion"],"recommendations":payload["recommendations"]})
+            st.markdown("**Internal auditor notes**")
+            st.write(audit.get("reviewer_notes") or "No internal notes saved.")
+            st.markdown("**Notes shared with contractor**")
+            st.write(audit.get("shared_notes") or "No shared notes saved.")
             if st.button("Delete this audit", key=f"delete_audit_{audit['id']}"): run("DELETE FROM server_tokens WHERE audit_id=?", (audit["id"],)); run("DELETE FROM audits WHERE id=?", (audit["id"],)); st.rerun()
     if len(audits) > 1:
         trend = pd.DataFrame([{"Date": row["audit_date"], "Score": row["score"]} for row in reversed(audits)]); st.plotly_chart(px.line(trend, x="Date", y="Score", markers=True), use_container_width=True)
 
 with tabs[4]:
     st.subheader("Temporary contractor view")
-    audits = q("SELECT * FROM audits WHERE server_id=? ORDER BY id DESC LIMIT 1", (server["id"],))
+    st.caption("This view uses the Streamlit app itself. The contractor does not need a ChatGPT account.")
+    audits = q("SELECT * FROM audits WHERE server_id=? ORDER BY completed DESC,id DESC LIMIT 1", (server["id"],))
     if not audits: st.info("Save an audit before generating a contractor view.")
-    elif st.button("Generate 15-minute token", type="primary"):
-        token = secrets.token_urlsafe(18); token_hash = hashlib.sha256(token.encode()).hexdigest(); expires = datetime.utcnow() + timedelta(minutes=15)
-        run("INSERT INTO server_tokens(token_hash,audit_id,expires_at,ended) VALUES(?,?,?,0)", (token_hash, audits[0]["id"], expires.isoformat()))
-        st.code(token); st.code(f"?view=server&token={token}"); st.caption("Append the displayed query string to this app’s public URL. The session expires after 15 minutes.")
+    else:
+        if not PUBLIC_APP_URL:
+            st.warning("Add PUBLIC_APP_URL to Streamlit Secrets before generating a link. Example: https://your-app.streamlit.app")
+        if st.button("Generate 15-minute server link", type="primary", disabled=not bool(PUBLIC_APP_URL)):
+            run("UPDATE server_tokens SET ended=1 WHERE audit_id=?", (audits[0]["id"],))
+            token = secrets.token_urlsafe(18)
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            expires = datetime.utcnow() + timedelta(minutes=15)
+            run("INSERT INTO server_tokens(token_hash,audit_id,expires_at,ended,created_at) VALUES(?,?,?,0,?)", (token_hash, audits[0]["id"], expires.isoformat(), now_iso()))
+            st.session_state[f"server_link_{server['id']}"] = f"{PUBLIC_APP_URL}/?{urlencode({'view':'server','token':token})}"
+        link = st.session_state.get(f"server_link_{server['id']}")
+        if link:
+            st.success("Server link ready. It expires 15 minutes after it was generated.")
+            st.text_input("Copy this complete link", value=link, key=f"copy_link_{server['id']}")
+            st.link_button("Test server view in a new tab", link)
+        if st.button("End all active server views for this audit"):
+            run("UPDATE server_tokens SET ended=1 WHERE audit_id=?", (audits[0]["id"],))
+            st.session_state.pop(f"server_link_{server['id']}", None)
+            st.success("Server access ended.")
+            st.rerun()
